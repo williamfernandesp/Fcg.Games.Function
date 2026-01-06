@@ -15,6 +15,13 @@ public class Function1
 
     private const string ExternalApi = "https://fcggamesapi-g2dcb2fafjftgzfy.chilecentral-01.azurewebsites.net/api/games/random";
 
+    // In-memory cache: updated only by the timer trigger
+    private static byte[]? _cachedContent;
+    private static string? _cachedContentType;
+    private static HttpStatusCode _cachedStatus = HttpStatusCode.OK;
+    private static DateTimeOffset? _lastUpdated;
+    private static readonly object _cacheLock = new();
+
     public Function1(ILogger<Function1> logger, IHttpClientFactory httpFactory)
     {
         _logger = logger;
@@ -25,29 +32,30 @@ public class Function1
     [Function("GetRandomGame")]
     public async Task<HttpResponseData> GetRandom([HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = "games/random")] HttpRequestData req)
     {
-        var client = _httpFactory.CreateClient();
+        // Copy cache to locals under lock to avoid holding lock during async IO
+        byte[]? content;
+        string? contentType;
+        HttpStatusCode status;
 
-        try
+        lock (_cacheLock)
         {
-            var externalResp = await client.GetAsync(ExternalApi);
-
-            var response = req.CreateResponse(externalResp.StatusCode);
-
-            if (externalResp.Content.Headers.ContentType?.ToString() is string ct)
-            {
-                response.Headers.Add("Content-Type", ct);
-            }
-
-            await externalResp.Content.CopyToAsync(response.Body);
-            return response;
+            content = _cachedContent;
+            contentType = _cachedContentType;
+            status = _cachedStatus;
         }
-        catch (Exception ex)
+
+        if (content == null)
         {
-            _logger.LogError(ex, "Error calling external API");
-            var error = req.CreateResponse(HttpStatusCode.InternalServerError);
-            await error.WriteStringAsync("Error calling external API");
-            return error;
+            var notReady = req.CreateResponse(HttpStatusCode.ServiceUnavailable);
+            notReady.Headers.Add("Content-Type", "text/plain; charset=utf-8");
+            await notReady.WriteStringAsync("No cached game yet. Wait for the timer (runs every 1 minute) to populate the cache.");
+            return notReady;
         }
+
+        var response = req.CreateResponse(status);
+        if (!string.IsNullOrEmpty(contentType)) response.Headers.Add("Content-Type", contentType);
+        await response.Body.WriteAsync(content, 0, content.Length);
+        return response;
     }
 
     // Timer trigger that runs every 1 minute
@@ -60,7 +68,17 @@ public class Function1
         try
         {
             var externalResp = await client.GetAsync(ExternalApi);
-            _logger.LogInformation("External API responded with {status}", externalResp.StatusCode);
+            var bytes = await externalResp.Content.ReadAsByteArrayAsync();
+
+            lock (_cacheLock)
+            {
+                _cachedContent = bytes;
+                _cachedContentType = externalResp.Content.Headers.ContentType?.ToString();
+                _cachedStatus = externalResp.StatusCode;
+                _lastUpdated = DateTimeOffset.UtcNow;
+            }
+
+            _logger.LogInformation("External API responded with {status} and cache was updated at {time}", externalResp.StatusCode, _lastUpdated);
         }
         catch (Exception ex)
         {
